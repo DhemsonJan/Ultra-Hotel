@@ -20,7 +20,7 @@ import http from "node:http";
 import { createReadStream } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { createStore } from "./store.mjs";
 import { quote, formatCode, stripCode, money, TERMS, PROMOS, bookableWindow } from "../shared/booking.mjs";
@@ -71,6 +71,24 @@ const send = (res, status, body, headers = {}) => {
 const json = (res, status, data, headers) => send(res, status, data, headers);
 
 async function readBody(req, limitBytes = 64 * 1024) {
+  // Serverless hosts (Vercel) buffer the body, expose it as `req.body`, then
+  // re-arm the stream. Reading that stream again is unreliable, so prefer the
+  // parsed value whenever the platform provided one.
+  if (req.body !== undefined && req.body !== null) {
+    let parsed;
+    try {
+      parsed = req.body;
+    } catch {
+      const err = new Error("body is not valid JSON");
+      err.status = 400;
+      throw err;
+    }
+    if (typeof parsed === "object" && !Buffer.isBuffer(parsed)) return parsed;
+    const text = Buffer.isBuffer(parsed) ? parsed.toString("utf8") : String(parsed);
+    return parseBodyText(text, req.headers["content-type"]);
+  }
+  if (req.readableEnded) return {};
+
   const chunks = [];
   let size = 0;
   for await (const chunk of req) {
@@ -83,8 +101,10 @@ async function readBody(req, limitBytes = 64 * 1024) {
     chunks.push(chunk);
   }
   if (!chunks.length) return {};
-  const text = Buffer.concat(chunks).toString("utf8");
-  const type = req.headers["content-type"] || "";
+  return parseBodyText(Buffer.concat(chunks).toString("utf8"), req.headers["content-type"]);
+}
+
+function parseBodyText(text, type = "") {
   if (type.includes("application/json")) {
     try {
       return JSON.parse(text);
@@ -184,10 +204,13 @@ const PAGES = new Set([
 
 /** Read once at boot so a miss does not hit the disk on every request. */
 let notFoundBody = null;
-try {
-  notFoundBody = await readFile(path.join(PUBLIC, "404.html"));
-} catch {
-  console.warn("[ultra] public/404.html is missing — unknown URLs will return JSON");
+if (!process.env.VERCEL) {
+  // On Vercel the static files are served by the CDN, not from this bundle.
+  try {
+    notFoundBody = await readFile(path.join(PUBLIC, "404.html"));
+  } catch {
+    console.warn("[ultra] public/404.html is missing — unknown URLs will return JSON");
+  }
 }
 
 async function serveStatic(req, res, pathname) {
@@ -555,10 +578,12 @@ async function handleApi(req, res, url, store) {
    Server
    -------------------------------------------------------------------------- */
 
-const store = await createStore();
+/** Created on first use so importing this module never opens the store. */
+let storePromise = null;
+const getStore = () => (storePromise ||= createStore());
 
-const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host || `${HOST}:${PORT}`}`);
+async function handleRequest(req, res) {
+  const url = new URL(req.url || "/", `http://${req.headers.host || `${HOST}:${PORT}`}`);
 
   res.setHeader("referrer-policy", "strict-origin-when-cross-origin");
   res.setHeader("x-frame-options", "SAMEORIGIN");
@@ -575,7 +600,7 @@ const server = http.createServer(async (req, res) => {
 
   try {
     if (url.pathname.startsWith("/api/")) {
-      return await handleApi(req, res, url, store);
+      return await handleApi(req, res, url, await getStore());
     }
     if (req.method === "GET" || req.method === "HEAD") {
       return await serveStatic(req, res, url.pathname);
@@ -586,24 +611,33 @@ const server = http.createServer(async (req, res) => {
     if (status >= 500) console.error("[ultra]", req.method, url.pathname, err);
     return json(res, status, { error: err.message || "Something went wrong" });
   }
-});
+}
 
-server.listen(PORT, HOST, () => {
-  const win = bookableWindow();
-  console.log("  Ultra Hotel Group | " + GROUP.promise);
-  console.log("  front end + booking API   http://" + `${HOST}:${PORT}`);
-  console.log("  collection                " + GROUP.properties + " hotels, " + GROUP.destinations + " destinations, " + BRANDS.length + " brands");
-  console.log("  store                     " + store.kind + " (" + store.file + ")");
-  console.log("  bookable                  " + win.start + " to " + win.end + ", min " + TERMS.minNights + " night");
-});
+const server = http.createServer(handleRequest);
 
-const shutdown = () => {
-  server.close(() => {
-    store.close();
-    process.exit(0);
+/* `node server/index.mjs` starts the local server; importing it (the Vercel
+   function in api/) must not listen on a port. */
+const isMain = Boolean(process.argv[1])
+  && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url;
+
+if (isMain) {
+  server.listen(PORT, HOST, () => {
+    const win = bookableWindow();
+    console.log("  Ultra Hotel Group | " + GROUP.promise);
+    console.log("  front end + booking API   http://" + `${HOST}:${PORT}`);
+    console.log("  collection                " + GROUP.properties + " hotels, " + GROUP.destinations + " destinations, " + BRANDS.length + " brands");
+    console.log("  bookable                  " + win.start + " to " + win.end + ", min " + TERMS.minNights + " night");
+    getStore().then((s) => console.log("  store                     " + s.kind + " (" + s.file + ")"));
   });
-};
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
 
-export { server, store };
+  const shutdown = () => {
+    server.close(() => {
+      if (storePromise) storePromise.then((s) => s.close());
+      process.exit(0);
+    });
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+}
+
+export { server, handleRequest, getStore };

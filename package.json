@@ -10,6 +10,7 @@
   "scripts": {
     "start": "node server/index.mjs",
     "dev": "node --watch server/index.mjs",
+    "build": "node tools/build-vercel.mjs",
     "reset": "node tools/reset-db.mjs",
     "test": "node --test"
   },

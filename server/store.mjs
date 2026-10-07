@@ -12,7 +12,11 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { randomCode } from "../shared/booking.mjs";
 
-const DATA_DIR = path.join(process.cwd(), "data");
+// Vercel's function filesystem is read-only outside /tmp, and the project
+// directory is not in the bundle anyway — keep the store where it can be written.
+const DATA_DIR = process.env.VERCEL
+  ? path.join("/tmp", "ultra-hotel-data")
+  : path.join(process.cwd(), "data");
 
 /* --------------------------------------------------------------------------
    SQLite
